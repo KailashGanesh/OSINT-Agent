@@ -1,5 +1,7 @@
 # OSINT Agent
 
+![OSINT Agent TUI](screenshot.png)
+
 LLM-driven CLI tool for open-source intelligence gathering. Give it a name, email, or social handle and it autonomously investigates across public sources, producing a structured Markdown report.
 
 ## How it works
