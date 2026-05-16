@@ -1,3 +1,13 @@
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass, field
+from typing import Any
+
+from openai import AsyncOpenAI
+
+from tools import tool_schemas, get_tool
+
 SYSTEM_PROMPT = """\
 You are a methodical OSINT analyst. Your task is to investigate a person
 using only public, legal, and ethical means.
@@ -61,3 +71,101 @@ Rate overall risk as Low / Medium / High with a brief justification.]
 If the person cannot be found or minimal data exists, produce the same
 template with "No data found" for each section — do not fabricate.
 """
+
+
+@dataclass
+class ToolCallRecord:
+    name: str
+    arguments: dict[str, Any]
+    result: str
+
+
+@dataclass
+class AgentResult:
+    report: str
+    tool_calls: list[ToolCallRecord] = field(default_factory=list)
+
+
+async def run(
+    client: AsyncOpenAI,
+    model: str,
+    subject: dict[str, str],
+    max_turns: int = 15,
+) -> AgentResult:
+    user_content = "Investigate this person:\n"
+    for key, value in subject.items():
+        user_content += f"- {key}: {value}\n"
+    user_content += (
+        "\nBe systematic. Use every relevant tool at your disposal. "
+        "End with the structured report."
+    )
+
+    messages: list[dict[str, Any]] = [
+        {"role": "system", "content": SYSTEM_PROMPT.format(max_turns=max_turns)},
+        {"role": "user", "content": user_content},
+    ]
+
+    records: list[ToolCallRecord] = []
+
+    for turn in range(max_turns):
+        response = await client.chat.completions.create(
+            model=model,
+            messages=messages,
+            tools=tool_schemas(),
+            tool_choice="auto",
+        )
+
+        choice = response.choices[0]
+
+        if choice.finish_reason == "tool_calls":
+            assistant_msg = choice.message
+            messages.append(assistant_msg.model_dump(exclude_none=True))
+
+            for tc in assistant_msg.tool_calls or []:
+                tool = get_tool(tc.function.name)
+                if tool is None:
+                    result = f"Unknown tool: {tc.function.name}"
+                    args = {}
+                else:
+                    try:
+                        args = json.loads(tc.function.arguments)
+                    except json.JSONDecodeError:
+                        args = {}
+                    try:
+                        result = await tool.execute(**args)
+                    except Exception as exc:
+                        result = f"Tool error: {exc}"
+
+                records.append(
+                    ToolCallRecord(
+                        name=tc.function.name,
+                        arguments=args,
+                        result=result,
+                    )
+                )
+
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tc.id,
+                    "content": result,
+                })
+
+        else:
+            report = choice.message.content or ""
+            return AgentResult(report=report, tool_calls=records)
+
+    messages.append({
+        "role": "user",
+        "content": (
+            f"You have used all {max_turns} available tool calls. "
+            "Do not request any more tools. Produce the final structured "
+            "report now based on everything you have gathered."
+        ),
+    })
+    response = await client.chat.completions.create(
+        model=model,
+        messages=messages,
+        tool_choice="none",
+    )
+    report = response.choices[0].message.content or ""
+    return AgentResult(report=report, tool_calls=records)
